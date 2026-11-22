@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from collections import Counter
 from datetime import date
@@ -66,6 +67,7 @@ def _get_cfg(key: str, default: str = "") -> str:
 
 INDEX_HF_REPO = _get_cfg("INDEX_HF_REPO", "sgowda/grkraj")
 DAILY_FREE_LIMIT = int(_get_cfg("DAILY_FREE_LIMIT", "20") or "20")
+GLOBAL_DAILY_LIMIT = int(_get_cfg("GLOBAL_DAILY_LIMIT", "100") or "100")
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'+\-]*")
 STOPWORDS = {
@@ -645,6 +647,49 @@ button[kind="secondary"]:hover {
     color: #F8FAFC !important;
 }
 
+/* Prominent Gemini API Key Card */
+.api-card-header {
+    background: linear-gradient(135deg, rgba(11, 22, 42, 0.96) 0%, rgba(12, 26, 46, 0.92) 100%);
+    border: 1px solid rgba(34, 211, 238, 0.34);
+    border-radius: 14px;
+    padding: 13px 15px 11px;
+    margin: 14px 0 8px;
+    box-shadow: 0 6px 20px rgba(6, 182, 212, 0.10);
+}
+.api-card-header.api-warn {
+    border-color: rgba(251, 191, 36, 0.48);
+    background: linear-gradient(135deg, rgba(32, 24, 14, 0.92) 0%, rgba(16, 22, 38, 0.94) 100%);
+    box-shadow: 0 6px 22px rgba(245, 158, 11, 0.12);
+}
+.api-card-header.api-ok {
+    border-color: rgba(52, 211, 153, 0.42);
+    background: linear-gradient(135deg, rgba(10, 29, 28, 0.92) 0%, rgba(12, 22, 40, 0.94) 100%);
+}
+.api-top {
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 6px; margin-bottom: 6px;
+}
+.api-title {
+    font-size: 0.84rem; font-weight: 700; color: #F8FAFC;
+    display: inline-flex; align-items: center; gap: 6px;
+}
+.api-badge {
+    font-size: 0.71rem; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+}
+.api-badge-ok { color: #6EE7B7; background: rgba(16, 185, 129, 0.16); border: 1px solid rgba(52, 211, 153, 0.38); }
+.api-badge-cyan { color: #67E8F9; background: rgba(6, 182, 212, 0.16); border: 1px solid rgba(34, 211, 238, 0.38); }
+.api-badge-warn { color: #FDE68A; background: rgba(245, 158, 11, 0.18); border: 1px solid rgba(251, 191, 36, 0.45); }
+.api-desc {
+    font-size: 0.80rem; color: #CBD5E1; line-height: 1.46; margin-bottom: 7px;
+}
+.api-desc a {
+    color: #67E8F9 !important; font-weight: 600; text-decoration: none;
+}
+.api-desc a:hover { text-decoration: underline; }
+.api-privacy {
+    font-size: 0.73rem; color: #94A3B8; margin-top: 2px;
+}
+
 /* Meta Bar */
 .meta-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .meta-chip {
@@ -849,16 +894,64 @@ def _clear_all():
     st.session_state["last_result"] = None
 
 
-def _check_session_quota() -> tuple[bool, int]:
+class GlobalDailyLimiter:
+    """Thread-safe app-wide daily safety cap shared across all visitors."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self._lock = threading.Lock()
+        self._day = date.today().isoformat()
+        self._used = 0
+
+    def _reset_if_new_day(self):
+        today = date.today().isoformat()
+        if self._day != today:
+            self._day = today
+            self._used = 0
+
+    def remaining(self) -> int:
+        with self._lock:
+            self._reset_if_new_day()
+            return max(0, self.limit - self._used)
+
+    def consume(self) -> tuple[bool, int]:
+        with self._lock:
+            self._reset_if_new_day()
+            if self._used >= self.limit:
+                return False, 0
+            self._used += 1
+            return True, self.limit - self._used
+
+
+@st.cache_resource
+def get_global_limiter(limit: int) -> GlobalDailyLimiter:
+    return GlobalDailyLimiter(limit)
+
+
+def _session_remaining() -> int:
+    today = date.today().isoformat()
+    q_state = st.session_state.get("quota", {"day": today, "used": 0})
+    if q_state["day"] != today:
+        return DAILY_FREE_LIMIT
+    return max(0, DAILY_FREE_LIMIT - q_state["used"])
+
+
+def _consume_shared_quota() -> tuple[bool, str, int, int]:
+    """Enforce both per-session DAILY_FREE_LIMIT and app-wide GLOBAL_DAILY_LIMIT."""
     today = date.today().isoformat()
     q_state = st.session_state.get("quota", {"day": today, "used": 0})
     if q_state["day"] != today:
         q_state = {"day": today, "used": 0}
     if q_state["used"] >= DAILY_FREE_LIMIT:
-        return False, 0
+        return False, "session", 0, get_global_limiter(GLOBAL_DAILY_LIMIT).remaining()
+
+    ok_global, glob_rem = get_global_limiter(GLOBAL_DAILY_LIMIT).consume()
+    if not ok_global:
+        return False, "global", max(0, DAILY_FREE_LIMIT - q_state["used"]), 0
+
     q_state["used"] += 1
     st.session_state["quota"] = q_state
-    return True, DAILY_FREE_LIMIT - q_state["used"]
+    return True, "ok", DAILY_FREE_LIMIT - q_state["used"], glob_rem
 
 
 def run_tutor_query(question: str, uploaded_file, user_api_key: str) -> dict:
@@ -871,23 +964,30 @@ def run_tutor_query(question: str, uploaded_file, user_api_key: str) -> dict:
 
     if custom_key:
         api_key = custom_key
-        quota_note = "Personal API key (unlimited)"
+        quota_note = "Personal Gemini key (unlimited)"
     elif server_key:
-        ok, rem = _check_session_quota()
+        ok, reason, sess_rem, glob_rem = _consume_shared_quota()
         if not ok:
+            if reason == "global":
+                return {
+                    "error": (
+                        f"Today's shared community safety limit ({GLOBAL_DAILY_LIMIT} questions/day across all visitors) has been reached. "
+                        "Paste your own free Gemini API key in the **Gemini API Key** card on the left (get one free at https://aistudio.google.com/apikey) to continue immediately!"
+                    )
+                }
             return {
                 "error": (
-                    f"Daily free limit ({DAILY_FREE_LIMIT} questions/day) reached for this session. "
-                    "Paste your own free Gemini API key from https://aistudio.google.com/apikey in the optional key box on the left for unlimited queries."
+                    f"Session free limit ({DAILY_FREE_LIMIT} questions/day) reached. "
+                    "Paste your own free Gemini API key in the **Gemini API Key** card on the left (https://aistudio.google.com/apikey) for unlimited questions!"
                 )
             }
         api_key = server_key
-        quota_note = f"{rem}/{DAILY_FREE_LIMIT} free queries left today"
+        quota_note = f"{sess_rem}/{DAILY_FREE_LIMIT} session · {glob_rem}/{GLOBAL_DAILY_LIMIT} community left today"
     else:
         return {
             "error": (
-                "No server `GEMINI_API_KEY` is configured yet. "
-                "Open **Optional: Use Your Own Free Gemini API Key** on the left and paste a free key from https://aistudio.google.com/apikey."
+                "Please paste your free **Gemini API Key** in the highlighted **Gemini API Key** box on the left to ask questions "
+                "(free in 30 seconds at https://aistudio.google.com/apikey)."
             )
         }
 
@@ -1013,19 +1113,70 @@ with col_left:
         with b2:
             st.button("Clear", type="secondary", use_container_width=True, on_click=_clear_all)
 
+        # Prominent Gemini API Key & Live Community Quota Card
+        _has_server_key = bool(_get_cfg("GEMINI_API_KEY") or _get_cfg("GOOGLE_API_KEY"))
+        _glob_left = get_global_limiter(GLOBAL_DAILY_LIMIT).remaining()
+        _sess_left = _session_remaining()
+        _cur_user_key = (st.session_state.get("user_api_key_input") or "").strip()
+
+        if _cur_user_key:
+            _card_cls = "api-card-header api-ok"
+            _badge_html = '<span class="api-badge api-badge-ok">&#10003; Personal Key Active (Unlimited)</span>'
+            _desc_html = (
+                'Using your personal Gemini API key for unlimited questions. '
+                'Need another key? <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio &#8599;</a>'
+            )
+        elif _has_server_key and _glob_left > 0 and _sess_left > 0:
+            _card_cls = "api-card-header"
+            _badge_html = f'<span class="api-badge api-badge-cyan">Free Pool: {_glob_left}/{GLOBAL_DAILY_LIMIT} left today</span>'
+            _desc_html = (
+                f'Shared free quota active ({_sess_left}/{DAILY_FREE_LIMIT} left in your session; {GLOBAL_DAILY_LIMIT}/day site-wide cap). '
+                'For unlimited questions, paste your own free key from '
+                '<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio &#8599;</a>:'
+            )
+        elif _has_server_key:
+            _card_cls = "api-card-header api-warn"
+            _badge_html = '<span class="api-badge api-badge-warn">Free Quota Reached Today</span>'
+            _desc_html = (
+                f'Daily free quota ({GLOBAL_DAILY_LIMIT}/day global or {DAILY_FREE_LIMIT}/session) is used up. '
+                'Paste your own free key from '
+                '<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio &#8599;</a> '
+                'below to keep studying:'
+            )
+        else:
+            _card_cls = "api-card-header api-warn"
+            _badge_html = '<span class="api-badge api-badge-warn">Required &middot; Free Key</span>'
+            _desc_html = (
+                'Paste your own free <strong>Gemini API Key</strong> below to start asking questions — '
+                'get one free in 30 seconds at '
+                '<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio &#8599;</a>:'
+            )
+
+        st.markdown(
+            f'<div class="{_card_cls}">'
+            '<div class="api-top">'
+            '<span class="api-title">&#128273; Gemini API Key</span>'
+            f"{_badge_html}"
+            "</div>"
+            f'<div class="api-desc">{_desc_html}</div>'
+            '<div class="api-privacy">&#128274; Kept strictly in session memory — never saved to disk or shared.</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        user_api_key = st.text_input(
+            "Gemini API Key",
+            key="user_api_key_input",
+            type="password",
+            label_visibility="collapsed",
+            placeholder="Paste Gemini API key (AIza...) — free at aistudio.google.com/apikey",
+        )
+
         st.markdown(
             '<div class="section-eyebrow" style="margin-top:16px;">Try a Molecular or Plant Biology Question</div>',
             unsafe_allow_html=True,
         )
         for idx, ex in enumerate(EXAMPLES):
             st.button(ex, key=f"ex_{idx}", type="secondary", use_container_width=True, on_click=_set_example, args=(ex,))
-
-        with st.expander("Optional: Use Your Own Free Gemini API Key (Unlimited)", expanded=False):
-            user_api_key = st.text_input(
-                "Personal Gemini API Key (kept in memory only, never saved)",
-                type="password",
-                placeholder="AIza... (free at aistudio.google.com/apikey)",
-            )
 
 should_run = ask_clicked or st.session_state.pop("run_query", False)
 if should_run:

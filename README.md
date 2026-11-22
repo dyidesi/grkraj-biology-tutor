@@ -15,8 +15,9 @@ Interactive Molecular Biology, Plant Cell Biology, and Pre-University Biology tu
    ```toml
    GEMINI_API_KEY = "AIza..."
    DAILY_FREE_LIMIT = "20"
+   GLOBAL_DAILY_LIMIT = "100"
    ```
-   *(Optional: you can even deploy with **no server key** and let students paste their own free Gemini key in the BYOK box!)*
+   *(Optional: you can also deploy with **no server key** — the prominent Gemini API Key card guides students to paste their own free key in 30 seconds!)*
 4. Click **Deploy** — share the permanent `https://<your-app>.streamlit.app` link with students! Works on any phone, Chromebook, or 8 GB laptop.
 
 ### Run `app.py` Locally
