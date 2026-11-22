@@ -52,6 +52,12 @@ LOCAL_IMAGES_ROOT = APP_DIR.parent
 
 EMBED_MODEL = "gemini-embedding-2"
 GEN_MODEL = "gemini-3.8-flash"
+GEN_FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+]
 
 
 def _get_cfg(key: str, default: str = "") -> str:
@@ -170,6 +176,52 @@ def ensure_index_present() -> Path:
     return target
 
 
+def _is_transient_gemini_error(exc: Exception) -> bool:
+    s = f"{type(exc).__name__}: {exc}".lower()
+    return any(tok in s for tok in ("503", "unavailable", "overloaded", "high demand", "500", "502", "504", "temporarily"))
+
+
+def _embed_with_retry(client: genai.Client, contents: list, dim: int):
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            return client.models.embed_content(
+                model=EMBED_MODEL,
+                contents=contents,
+                config=types.EmbedContentConfig(output_dimensionality=dim),
+            )
+        except Exception as exc:
+            last_exc = exc
+            if _is_transient_gemini_error(exc) and attempt < 2:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
+
+
+def _generate_with_fallback(client: genai.Client, parts: list) -> tuple[str, str]:
+    """Call gemini-3.8-flash with automatic retry + fallback to 3.7/3.6/3.5-flash on 503 demand spikes."""
+    last_exc: Exception | None = None
+    for model_name in GEN_FALLBACK_MODELS:
+        attempts = 2 if model_name == GEN_FALLBACK_MODELS[0] else 1
+        for attempt in range(attempts):
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=types.Content(parts=parts),
+                )
+                return (resp.text or "").strip(), model_name
+            except Exception as exc:
+                last_exc = exc
+                if _is_transient_gemini_error(exc):
+                    if attempt + 1 < attempts:
+                        time.sleep(1.5)
+                        continue
+                    break  # Try next fallback flash model
+                raise
+    raise last_exc  # type: ignore[misc]
+
+
 class GrkrajIndex:
     def __init__(self, idx_dir: Path):
         self.items = [
@@ -266,13 +318,13 @@ class GrkrajIndex:
     ) -> tuple[list[dict], list[dict]]:
         sub_queries = split_multi_topic_query(query) if (query and not image_bytes) else []
         if len(sub_queries) >= 2:
-            resp = client.models.embed_content(
-                model=EMBED_MODEL,
-                contents=[
+            resp = _embed_with_retry(
+                client,
+                [
                     types.Content(parts=[types.Part.from_text(text=f"task: search biology lecture notes | query: {sq}")])
                     for sq in sub_queries
                 ],
-                config=types.EmbedContentConfig(output_dimensionality=self.dim),
+                self.dim,
             )
             eff_top_text = max(top_text, min(8, 2 * len(sub_queries)))
             eff_top_images = max(top_images, min(4, len(sub_queries)))
@@ -321,11 +373,7 @@ class GrkrajIndex:
             parts.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
         if query:
             parts.append(types.Part.from_text(text=f"task: search biology lecture notes | query: {query}"))
-        resp = client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=[types.Content(parts=parts)],
-            config=types.EmbedContentConfig(output_dimensionality=self.dim),
-        )
+        resp = _embed_with_retry(client, [types.Content(parts=parts)], self.dim)
         q_vec = l2_normalize(np.array(resp.embeddings[0].values, dtype=np.float32))
         return self._rank_for_vector(q_vec, query, top_text, top_images)
 
@@ -1057,12 +1105,10 @@ def run_tutor_query(question: str, uploaded_file, user_api_key: str) -> dict:
 
     parts.append(types.Part.from_text(text=f"\nStudent Question: {effective_q}"))
 
-    resp = client.models.generate_content(
-        model=GEN_MODEL,
-        contents=types.Content(parts=parts),
-    )
-    raw_ans = (resp.text or "").strip()
+    raw_ans, used_model = _generate_with_fallback(client, parts)
     elapsed = time.monotonic() - t0
+    if used_model != GEN_MODEL:
+        quota_note = f"{used_model} (auto-fallback) · {quota_note}"
 
     return {
         "meta_html": render_meta_bar(elapsed, text_hits, img_hits, quota_note),
@@ -1168,7 +1214,7 @@ with col_left:
             key="user_api_key_input",
             type="password",
             label_visibility="collapsed",
-            placeholder="Paste Gemini API key (AIza...) — free at aistudio.google.com/apikey",
+            placeholder="Paste Gemini API key (AIza... or AQ....) — free at aistudio.google.com/apikey",
         )
 
         st.markdown(
