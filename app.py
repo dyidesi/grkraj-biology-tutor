@@ -416,15 +416,25 @@ def load_diagram_bytes(hit: dict) -> tuple[bytes | None, str]:
     return None, "image/png"
 
 
+_MATH_BLOCK_RE = re.compile(r"(\$\$[\s\S]+?\$\$|\$(?!\s)[^$\n]+?(?<!\s)\$)")
+_MATH_CITE_RE = re.compile(
+    r"(?:\\(?:quad|qquad|,|;|!|\s+))*"
+    r"(?:\[\s*\\(?:text|mathrm|textbf)\s*\{([^}]+)\}\s*\]"
+    r"|\\(?:text|mathrm|textbf)\s*\{\s*\[([^\]]+)\]\s*\}"
+    r"|\[\s*((?:(?:Text|Diagram)\s+\d+(?:\s*[,;/]\s*|\s+and\s+)?)+)\s*\])"
+)
+
+
 def linkify_citations(text: str, text_hits: list[dict], img_hits: list[dict]) -> str:
-    """Convert [Text 1], [Text 1, Diagram 2], or bare Text 1 / Diagram 1 into clean clickable links."""
+    """Convert [Text 1], [Text 1, Diagram 2], or bare Text 1 / Diagram 1 into clean clickable links
+    while keeping LaTeX math ($...$ / $$...$$) 100% intact (moving any stray citations out of math)."""
     t_urls = {i: h.get("page_url", "") for i, h in enumerate(text_hits, 1)}
     d_urls = {i: (h.get("image_url") or h.get("page_url") or "") for i, h in enumerate(img_hits, 1)}
 
-    def _replace_bracket_group(m: re.Match) -> str:
-        tokens = re.findall(r"\b(Text|Diagram)\s+(\d+)\b", m.group(1))
+    def _tokens_to_pills(s: str) -> str | None:
+        tokens = re.findall(r"\b(Text|Diagram)\s+(\d+)\b", s)
         if not tokens:
-            return m.group(0)
+            return None
         pills = []
         for kind, num_s in tokens:
             n = int(num_s)
@@ -432,18 +442,49 @@ def linkify_citations(text: str, text_hits: list[dict], img_hits: list[dict]) ->
             pills.append(f"[{kind} {n}]({u})" if u else f"**{kind} {n}**")
         return " ".join(pills)
 
-    text = re.sub(
-        r"\[(\s*(?:(?:Text|Diagram)\s+\d+(?:\s*[,;/]\s*|\s+and\s+)?)+)\]",
-        _replace_bracket_group,
-        text,
-    )
-    for i, u in t_urls.items():
-        if u:
-            text = re.sub(rf"(?<!\[)\bText {i}\b(?!\])", f"[Text {i}]({u})", text)
-    for i, u in d_urls.items():
-        if u:
-            text = re.sub(rf"(?<!\[)\bDiagram {i}\b(?!\])", f"[Diagram {i}]({u})", text)
-    return text
+    def _replace_bracket_group(m: re.Match) -> str:
+        res = _tokens_to_pills(m.group(1))
+        return res if res is not None else m.group(0)
+
+    def _linkify_prose(seg: str) -> str:
+        seg = re.sub(
+            r"\[(\s*(?:(?:Text|Diagram)\s+\d+(?:\s*[,;/]\s*|\s+and\s+)?)+)\]",
+            _replace_bracket_group,
+            seg,
+        )
+        for i, u in t_urls.items():
+            if u:
+                seg = re.sub(rf"(?<!\[)\bText {i}\b(?!\])", f"[Text {i}]({u})", seg)
+        for i, u in d_urls.items():
+            if u:
+                seg = re.sub(rf"(?<!\[)\bDiagram {i}\b(?!\])", f"[Diagram {i}]({u})", seg)
+        return seg
+
+    out_parts: list[str] = []
+    for part in _MATH_BLOCK_RE.split(text):
+        if not part:
+            continue
+        if (part.startswith("$$") and part.endswith("$$")) or (part.startswith("$") and part.endswith("$")):
+            delim = "$$" if part.startswith("$$") else "$"
+            inner = part[len(delim) : -len(delim)]
+            extracted_pills: list[str] = []
+
+            def _pull_cite(cm: re.Match) -> str:
+                raw_c = cm.group(1) or cm.group(2) or cm.group(3) or ""
+                pills = _tokens_to_pills(raw_c)
+                if pills:
+                    extracted_pills.append(pills)
+                    return ""
+                return cm.group(0)
+
+            cleaned_inner = _MATH_CITE_RE.sub(_pull_cite, inner).strip()
+            rebuilt = f"{delim}{cleaned_inner}{delim}" if cleaned_inner else ""
+            if extracted_pills:
+                rebuilt = (rebuilt + " " if rebuilt else "") + " ".join(extracted_pills)
+            out_parts.append(rebuilt)
+        else:
+            out_parts.append(_linkify_prose(part))
+    return "".join(out_parts)
 
 
 def render_meta_bar(elapsed_s: float, text_hits: list[dict], img_hits: list[dict], quota_note: str) -> str:
@@ -1069,6 +1110,7 @@ def run_tutor_query(question: str, uploaded_file, user_api_key: str) -> dict:
                 "Prof. Dr. G. R. Kantharaj's lecture notes and diagrams (grkraj.org). "
                 "Address EVERY topic asked by the student in clear structured sections, "
                 "and ALWAYS cite sources inline as [Text 1], [Text 2], [Diagram 1], [Diagram 2] in each section. "
+                "NEVER put [Text N] or [Diagram N] citations inside LaTeX math ($...$ or $$...$$); always place citations outside math after the closing $. "
                 "If a detail is not in the retrieved notes, say so.\n\n"
             )
         )
