@@ -376,8 +376,10 @@ class GrkrajIndex:
         image_mime: str | None,
         top_text: int = 4,
         top_images: int = 2,
+        sub_queries: list[str] | None = None,
     ) -> tuple[list[dict], list[dict]]:
-        sub_queries = split_multi_topic_query(query) if (query and not image_bytes) else []
+        if sub_queries is None:
+            sub_queries = split_multi_topic_query(query) if (query and not image_bytes) else []
         if len(sub_queries) >= 2:
             resp = _embed_with_retry(
                 client,
@@ -440,7 +442,7 @@ class GrkrajIndex:
 
 
 @st.cache_resource(show_spinner="Loading grkraj.org 222-chapter multimodal index...")
-def load_index() -> GrkrajIndex:
+def load_index(_cache_ver: int = 2) -> GrkrajIndex:
     return GrkrajIndex(ensure_index_present())
 
 
@@ -1159,6 +1161,7 @@ def run_tutor_query(question: str, uploaded_file, user_api_key: str, status_cb=N
         status_cb("1/3 Searching all 222 chapters & 9,234 diagrams...")
     index = load_index()
     client = _make_gemini_client(api_key, timeout_ms=65_000)
+    sub_queries = split_multi_topic_query(q) if (q and not q_img_bytes) else []
     text_hits, img_hits = index.search(
         client,
         query=q or None,
@@ -1166,6 +1169,7 @@ def run_tutor_query(question: str, uploaded_file, user_api_key: str, status_cb=N
         image_mime=q_img_mime,
         top_text=4,
         top_images=2,
+        sub_queries=sub_queries,
     )
 
     parts = [
