@@ -29,6 +29,7 @@ import re
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
@@ -51,13 +52,16 @@ APP_DIR = Path(__file__).resolve().parent
 LOCAL_IMAGES_ROOT = APP_DIR.parent
 
 EMBED_MODEL = "gemini-embedding-2"
-GEN_MODEL = "gemini-3.8-flash"
+GEN_MODEL = "gemini-3.5-flash"
 GEN_FALLBACK_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
     "gemini-3.8-flash",
     "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
 ]
+MODEL_COOLDOWN_SECS = 600  # Skip a model for 10 min after a 503/timeout so queries stay snappy
 
 
 def _get_cfg(key: str, default: str = "") -> str:
@@ -176,9 +180,32 @@ def ensure_index_present() -> Path:
     return target
 
 
+@st.cache_resource
+def _get_model_cooldowns() -> dict[str, float]:
+    return {}
+
+
+def _make_gemini_client(api_key: str, timeout_ms: int = 25_000) -> genai.Client:
+    """Create a fast-failing Gemini client (disables SDK's hidden 5x exponential retry stall on 503)."""
+    try:
+        opts = types.HttpOptions(
+            timeout=timeout_ms,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        )
+        return genai.Client(api_key=api_key, http_options=opts)
+    except Exception:
+        return genai.Client(api_key=api_key)
+
+
 def _is_transient_gemini_error(exc: Exception) -> bool:
     s = f"{type(exc).__name__}: {exc}".lower()
-    return any(tok in s for tok in ("503", "unavailable", "overloaded", "high demand", "500", "502", "504", "temporarily"))
+    return any(
+        tok in s
+        for tok in (
+            "503", "unavailable", "overloaded", "high demand",
+            "500", "502", "504", "temporarily", "timeout", "timed out", "deadline",
+        )
+    )
 
 
 def _embed_with_retry(client: genai.Client, contents: list, dim: int):
@@ -193,32 +220,36 @@ def _embed_with_retry(client: genai.Client, contents: list, dim: int):
         except Exception as exc:
             last_exc = exc
             if _is_transient_gemini_error(exc) and attempt < 2:
-                time.sleep(1.2 * (attempt + 1))
+                time.sleep(0.8 * (attempt + 1))
                 continue
             raise
     raise last_exc  # type: ignore[misc]
 
 
-def _generate_with_fallback(client: genai.Client, parts: list) -> tuple[str, str]:
-    """Call gemini-3.8-flash with automatic retry + fallback to 3.7/3.6/3.5-flash on 503 demand spikes."""
+def _generate_with_fallback(client: genai.Client, parts: list, status_cb=None) -> tuple[str, str]:
+    """Fail over immediately across Flash models (skipping recently 503'd models for 10 min)."""
+    cooldowns = _get_model_cooldowns()
+    now = time.monotonic()
+    ordered = [m for m in GEN_FALLBACK_MODELS if cooldowns.get(m, 0.0) <= now]
+    # Always keep cooled-down models as a last resort if every model cooled down
+    ordered.extend([m for m in GEN_FALLBACK_MODELS if m not in ordered])
+
     last_exc: Exception | None = None
-    for model_name in GEN_FALLBACK_MODELS:
-        attempts = 2 if model_name == GEN_FALLBACK_MODELS[0] else 1
-        for attempt in range(attempts):
-            try:
-                resp = client.models.generate_content(
-                    model=model_name,
-                    contents=types.Content(parts=parts),
-                )
-                return (resp.text or "").strip(), model_name
-            except Exception as exc:
-                last_exc = exc
-                if _is_transient_gemini_error(exc):
-                    if attempt + 1 < attempts:
-                        time.sleep(1.5)
-                        continue
-                    break  # Try next fallback flash model
-                raise
+    for model_name in ordered:
+        if status_cb:
+            status_cb(f"3/3 Generating grounded explanation with `{model_name}`...")
+        try:
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=types.Content(parts=parts),
+            )
+            return (resp.text or "").strip(), model_name
+        except Exception as exc:
+            last_exc = exc
+            if _is_transient_gemini_error(exc):
+                cooldowns[model_name] = time.monotonic() + MODEL_COOLDOWN_SECS
+                continue
+            raise
     raise last_exc  # type: ignore[misc]
 
 
@@ -392,28 +423,34 @@ def label_item(it: dict) -> str:
     return s
 
 
+def _shrink_to_jpeg(raw_bytes: bytes, max_side: int = 768) -> tuple[bytes, str]:
+    pil = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    pil.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=84, optimize=True)
+    return buf.getvalue(), "image/jpeg"
+
+
 def load_diagram_bytes(hit: dict) -> tuple[bytes | None, str]:
-    """Load diagram locally if present, otherwise fetch live from grkraj.org image_url."""
+    """Load diagram locally if present, otherwise fetch live from grkraj.org (resized JPEG for fast upload)."""
     rel = hit.get("image_path")
     if rel:
         local_p = LOCAL_IMAGES_ROOT / rel
         if local_p.exists():
-            data = local_p.read_bytes()
-            mime = "image/jpeg" if local_p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
-            return data, mime
+            try:
+                return _shrink_to_jpeg(local_p.read_bytes())
+            except Exception:
+                pass
 
     url = hit.get("image_url")
     if url:
         try:
-            r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(url, timeout=4.5, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200 and len(r.content) > 500:
-                pil = Image.open(io.BytesIO(r.content)).convert("RGB")
-                buf = io.BytesIO()
-                pil.save(buf, format="PNG")
-                return buf.getvalue(), "image/png"
+                return _shrink_to_jpeg(r.content)
         except Exception:
             pass
-    return None, "image/png"
+    return None, "image/jpeg"
 
 
 _MATH_BLOCK_RE = re.compile(r"(\$\$[\s\S]+?\$\$|\$(?!\s)[^$\n]+?(?<!\s)\$)")
@@ -947,7 +984,7 @@ HERO_HTML = """
   <div class="hero-pills">
     <span class="pill pill-live"><span class="live-dot"></span>Free Web App</span>
     <span class="pill">222 Chapters &middot; 9,234 Diagrams</span>
-    <span class="pill pill-model">Gemini Embedding 2 &plus; Gemini 3.8 Flash</span>
+    <span class="pill pill-model">Gemini Embedding 2 &plus; Gemini Flash</span>
   </div>
 </div>
 """
@@ -1043,7 +1080,7 @@ def _consume_shared_quota() -> tuple[bool, str, int, int]:
     return True, "ok", DAILY_FREE_LIMIT - q_state["used"], glob_rem
 
 
-def run_tutor_query(question: str, uploaded_file, user_api_key: str) -> dict:
+def run_tutor_query(question: str, uploaded_file, user_api_key: str, status_cb=None) -> dict:
     q = (question or "").strip()
     if not q and uploaded_file is None:
         return {"error": "Please enter a biology question or upload a biology diagram image."}
@@ -1084,16 +1121,14 @@ def run_tutor_query(question: str, uploaded_file, user_api_key: str) -> dict:
     q_img_bytes = None
     q_img_mime = None
     if uploaded_file is not None:
-        im = Image.open(uploaded_file).convert("RGB")
-        buf = io.BytesIO()
-        im.save(buf, format="PNG")
-        q_img_bytes = buf.getvalue()
-        q_img_mime = "image/png"
+        q_img_bytes, q_img_mime = _shrink_to_jpeg(uploaded_file.getvalue())
 
     effective_q = q or "Explain the biological structures and pathway shown in this diagram using the lecture notes."
 
+    if status_cb:
+        status_cb("1/3 Searching all 222 chapters & 9,234 diagrams...")
     index = load_index()
-    client = genai.Client(api_key=api_key)
+    client = _make_gemini_client(api_key, timeout_ms=35_000)
     text_hits, img_hits = index.search(
         client,
         query=q or None,
@@ -1118,9 +1153,13 @@ def run_tutor_query(question: str, uploaded_file, user_api_key: str) -> dict:
     for i, h in enumerate(text_hits, 1):
         parts.append(types.Part.from_text(text=f"[Text {i}: {label_item(h)}]\n{h['text']}\n\n"))
 
+    if status_cb:
+        status_cb(f"2/3 Loading {len(img_hits)} matching biology diagrams...")
+    with ThreadPoolExecutor(max_workers=max(1, len(img_hits))) as ex:
+        loaded_imgs = list(ex.map(load_diagram_bytes, img_hits))
+
     diagrams_payload = []
-    for i, h in enumerate(img_hits, 1):
-        img_bytes, img_mime = load_diagram_bytes(h)
+    for i, (h, (img_bytes, img_mime)) in enumerate(zip(img_hits, loaded_imgs), 1):
         title = label_item(h)
         cap = (h.get("caption") or "").strip()
         if img_bytes:
@@ -1147,10 +1186,9 @@ def run_tutor_query(question: str, uploaded_file, user_api_key: str) -> dict:
 
     parts.append(types.Part.from_text(text=f"\nStudent Question: {effective_q}"))
 
-    raw_ans, used_model = _generate_with_fallback(client, parts)
+    raw_ans, used_model = _generate_with_fallback(client, parts, status_cb=status_cb)
     elapsed = time.monotonic() - t0
-    if used_model != GEN_MODEL:
-        quota_note = f"{used_model} (auto-fallback) · {quota_note}"
+    quota_note = f"{used_model} · {quota_note}"
 
     return {
         "meta_html": render_meta_bar(elapsed, text_hits, img_hits, quota_note),
@@ -1269,11 +1307,19 @@ with col_left:
 should_run = ask_clicked or st.session_state.pop("run_query", False)
 if should_run:
     with col_right:
-        with st.spinner("Searching all 222 chapters & 9,234 diagrams and generating grounded explanation..."):
+        with st.status("Starting search across grkraj.org...", expanded=True) as status_box:
+            def _update_status(msg: str):
+                status_box.update(label=msg, state="running")
             try:
-                st.session_state["last_result"] = run_tutor_query(question, uploaded_img, user_api_key)
+                res_obj = run_tutor_query(question, uploaded_img, user_api_key, status_cb=_update_status)
+                st.session_state["last_result"] = res_obj
+                if res_obj.get("error"):
+                    status_box.update(label="Request stopped — see message below", state="error", expanded=False)
+                else:
+                    status_box.update(label="Done!", state="complete", expanded=False)
             except Exception as exc:
                 st.session_state["last_result"] = {"error": f"Error querying Gemini API: `{type(exc).__name__}: {exc}`"}
+                status_box.update(label="Gemini API error", state="error", expanded=False)
 
 with col_right:
     with st.container(border=True):
