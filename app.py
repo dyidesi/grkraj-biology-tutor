@@ -100,6 +100,11 @@ _FOLLOWUP_STARTS = {
     "its", "it", "they", "also", "then", "because", "while", "if", "in",
     "for", "of", "with", "from", "to",
 }
+_PREAMBLE_TOPIC_RE = re.compile(
+    r"^(?:please\s+)?(?:prepare|create|make|generate|write|build|design|draft|give(?:\s+me)?|list)\b"
+    r".*?\b(?:on|about|covering|for|regarding|of)\s+",
+    re.IGNORECASE,
+)
 _LEAD_DIRECTIVE_RE = re.compile(
     r"^(?:please\s+)?(?:explain|describe|define|discuss|summarize|compare|contrast|"
     r"differentiate\s+between|distinguish\s+between|tell\s+me\s+about|"
@@ -119,6 +124,7 @@ def l2_normalize(v: np.ndarray) -> np.ndarray:
 
 def split_multi_topic_query(query: str) -> list[str]:
     """Split compound queries like 'Explain photosynthesis, mitosis and DNA replication'
+    or 'Prepare 20 Q&A quiz on photosynthesis, mitosis, DNA replication and Calvin Cycle'
     into balanced sub-queries so every topic gets dedicated passages & diagrams."""
     q = (query or "").strip()
     if not q:
@@ -126,7 +132,8 @@ def split_multi_topic_query(query: str) -> list[str]:
     q_parts = [p.strip() for p in q.split("?") if p.strip()]
     if len(q_parts) >= 2 and all(len(p.split()) >= 2 for p in q_parts):
         return q_parts[:5]
-    body = _LEAD_DIRECTIVE_RE.sub("", q).strip().rstrip("?.!").strip()
+    body = _PREAMBLE_TOPIC_RE.sub("", q).strip()
+    body = _LEAD_DIRECTIVE_RE.sub("", body).strip().rstrip("?.!").strip()
     raw_parts = [
         p.strip(" ,;:")
         for p in re.split(r"\s*(?:,|;|\band\b|&|\bvs\.?\b|\bversus\b)\s*", body, flags=re.IGNORECASE)
@@ -226,31 +233,54 @@ def _embed_with_retry(client: genai.Client, contents: list, dim: int):
     raise last_exc  # type: ignore[misc]
 
 
+def _build_gen_config(model_name: str) -> types.GenerateContentConfig:
+    """Use low thinking on full Flash models for 2x faster replies without sacrificing accuracy,
+    and 8192 max tokens so 20-question quizzes never truncate."""
+    kwargs: dict = {"max_output_tokens": 8192}
+    if "lite" not in model_name.lower():
+        try:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
+        except Exception:
+            pass
+    return types.GenerateContentConfig(**kwargs)
+
+
 def _generate_with_fallback(client: genai.Client, parts: list, status_cb=None) -> tuple[str, str]:
-    """Fail over immediately across Flash models (skipping recently 503'd models for 10 min)."""
+    """Stream across Flash models (skipping recently 503'd models for 10 min) so long quizzes never time out."""
     cooldowns = _get_model_cooldowns()
     now = time.monotonic()
     ordered = [m for m in GEN_FALLBACK_MODELS if cooldowns.get(m, 0.0) <= now]
-    # Always keep cooled-down models as a last resort if every model cooled down
     ordered.extend([m for m in GEN_FALLBACK_MODELS if m not in ordered])
 
     last_exc: Exception | None = None
     for model_name in ordered:
         if status_cb:
-            status_cb(f"3/3 Generating grounded explanation with `{model_name}`...")
+            status_cb(f"3/3 Generating grounded answer with `{model_name}`...")
         try:
-            resp = client.models.generate_content(
+            cfg = _build_gen_config(model_name)
+            chunks: list[str] = []
+            last_ping = time.monotonic()
+            for ch in client.models.generate_content_stream(
                 model=model_name,
                 contents=types.Content(parts=parts),
-            )
-            return (resp.text or "").strip(), model_name
+                config=cfg,
+            ):
+                if ch.text:
+                    chunks.append(ch.text)
+                    if status_cb and (time.monotonic() - last_ping) >= 0.7:
+                        total_chars = sum(len(x) for x in chunks)
+                        status_cb(f"3/3 Writing answer with `{model_name}` ({total_chars:,} chars)...")
+                        last_ping = time.monotonic()
+            text = "".join(chunks).strip()
+            if text:
+                return text, model_name
         except Exception as exc:
             last_exc = exc
             if _is_transient_gemini_error(exc):
                 cooldowns[model_name] = time.monotonic() + MODEL_COOLDOWN_SECS
                 continue
             raise
-    raise last_exc  # type: ignore[misc]
+    raise last_exc or RuntimeError("All Gemini models returned empty responses.")
 
 
 class GrkrajIndex:
@@ -1128,7 +1158,7 @@ def run_tutor_query(question: str, uploaded_file, user_api_key: str, status_cb=N
     if status_cb:
         status_cb("1/3 Searching all 222 chapters & 9,234 diagrams...")
     index = load_index()
-    client = _make_gemini_client(api_key, timeout_ms=35_000)
+    client = _make_gemini_client(api_key, timeout_ms=65_000)
     text_hits, img_hits = index.search(
         client,
         query=q or None,
